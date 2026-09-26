@@ -168,6 +168,8 @@ extern "C" {
         size_t memory_free;
         // device total memory in bytes
         size_t memory_total;
+        // device memory bandwidth in bytes/sec (0 if unknown)
+        size_t memory_bandwidth;
         // device type
         enum ggml_backend_dev_type type;
         // device id

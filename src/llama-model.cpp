@@ -1490,6 +1490,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     std::vector<float> splits(n_devices());
     if (all_zero) {
         // default split, by free memory
+        // when all devices report a memory bandwidth, weight the split by it so that more of the model
+        // ends up on the faster device; decode is usually memory-bandwidth-bound
+        std::vector<size_t> bw(n_devices(), 1);
+        bool have_bw = true;
+        for (size_t i = 0; i < n_devices(); ++i) {
+            ggml_backend_dev_props props = {};
+            ggml_backend_dev_get_props(devices[i].dev, &props);
+            if (props.memory_bandwidth == 0) {
+                have_bw = false;
+                break;
+            }
+            bw[i] = props.memory_bandwidth;
+        }
         for (size_t i = 0; i < n_devices(); ++i) {
             ggml_backend_dev_t dev = devices[i].dev;
             size_t total;
@@ -1502,7 +1515,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (free == 0 && total == 0) {
                 ggml_backend_dev_memory(cpu_dev, &free, &total);
             }
-            splits[i] = free;
+            splits[i] = have_bw ? float(free * bw[i]) : float(free);
+            LLAMA_LOG_DEBUG("load_tensors: TEMP device %zu free = %zu MiB, bw = %zu GB/s\n", i, free >> 20, bw[i] / 1000000000ull);
         }
     } else {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());

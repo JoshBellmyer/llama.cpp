@@ -5100,6 +5100,11 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
     props->device_id   = ctx->pci_bus_id.empty() ? nullptr : ctx->pci_bus_id.c_str();
     ggml_backend_cuda_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
+    // theoretical memory bandwidth; approximate for some memory types (HBM, GDDR6X), but consistent across devices
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
+    props->memory_bandwidth = (size_t)(prop.memoryBusWidth / 8) * (size_t)prop.memoryClockRate * 1000ull * 2;
+
     bool host_buffer = getenv("GGML_CUDA_NO_PINNED") == nullptr;
 #ifdef GGML_CUDA_NO_PEER_COPY
     bool events = false;
