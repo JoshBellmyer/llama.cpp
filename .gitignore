@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+# Context Flush (pi extension)
+context_store.md
+context_index.md
+.pi/context-flush/

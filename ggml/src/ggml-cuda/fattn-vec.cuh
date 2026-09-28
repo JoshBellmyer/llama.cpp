@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size, ncols2 = q-heads per block (GQA batching)
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -103,51 +103,69 @@ static __global__ void flash_attn_ext_vec(
 
     const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
 
-    const int sequence = blockIdx.z / ne02;
-    const int head = blockIdx.z - sequence*ne02;
-    const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
-    Q += nb03*sequence + nb02* head              + nb01*ic0;
+    constexpr int ncol_tot = ncols*ncols2; // total number of q-columns handled by this block
+    const int gqa_ratio = ne02 / ne12;     // With grouped query attention there are > 1 Q matrices per K, V matrix.
+
+    // With ncols2 > 1 one block computes all q-heads sharing a K/V head so each KV tile is read from memory only once:
+    int sequence, head; // head = first q-head of the group handled by this block
+    if constexpr (ncols2 == 1) {
+        sequence = blockIdx.z / ne02;
+        head     = blockIdx.z - sequence*ne02;
+    } else {
+        const int ntiles_z_gqa = gqa_ratio / ncols2; // exact: the launcher only picks a dividing ncols2
+        sequence = blockIdx.z / (ntiles_z_gqa*ne12);
+        const int rem  = blockIdx.z % (ntiles_z_gqa*ne12);
+        head     = (rem/ntiles_z_gqa)*gqa_ratio + (rem%ntiles_z_gqa)*ncols2;
+    }
+
+    Q += nb03*sequence + nb02*head              + nb01*ic0;
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
-    const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+    // ALiBi slopes differ per head, so GQA batching requires max_bias == 0 (enforced by the launcher):
+    const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head, n_head_log2, m0, m1) : 1.0f;
 
     static_assert(D % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
     constexpr int nwarps = nthreads / WARP_SIZE;
     const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     __builtin_assume(tid < nthreads);
 
+    static_assert(ncols2 == 1 || (type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16), "GQA batching is only implemented for quantized K");
+
     constexpr int ne_KQ      = ncols*D;
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
+    // The KQ shared memory is reused: Q scratch in the prologue, per-tile scores [column][thread] in the main loop.
+    constexpr int ne_score   = ncol_tot*nthreads;
+    constexpr int ne_KQ_max  = ne_KQ > ne_combine ? ne_KQ : ne_combine;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-    half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    half2            VKQ[ncol_tot][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
+    __shared__ half   KQ[ne_KQ_max > ne_score ? ne_KQ_max : ne_score];
 #else
-    float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    float2           VKQ[ncol_tot][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
+    __shared__ float  KQ[ne_KQ_max > ne_score ? ne_KQ_max : ne_score];
 #endif // V_DOT2_F32_F16_AVAILABLE
 
-    float KQ_max[ncols];
-    float KQ_sum[ncols];
+    float KQ_max[ncol_tot];
+    float KQ_sum[ncol_tot];
 #pragma unroll
-    for (int j = 0; j < ncols; ++j) {
-        KQ_max[j] = -FLT_MAX/2.0f;
-        KQ_sum[j] = 0.0f;
+    for (int c = 0; c < ncol_tot; ++c) {
+        KQ_max[c] = -FLT_MAX/2.0f;
+        KQ_sum[c] = 0.0f;
     }
 
     // Convert Q to float2 (f16 K) or q8_1 (quantized K) and store in registers:
 #ifdef V_DOT2_F32_F16_AVAILABLE
-    half2  Q_reg[ncols][(D/2)/nthreads_KQ]; // Will be initialized completely.
+    half2  Q_reg[ncol_tot][(D/2)/nthreads_KQ]; // Will be initialized completely.
 #else
-    __align__(16) float2 Q_reg[ncols][(D/2)/nthreads_KQ] = {{{0.0f, 0.0f}}}; // May be only partially initialized.
+    __align__(16) float2 Q_reg[ncol_tot][(D/2)/nthreads_KQ] = {{{0.0f, 0.0f}}}; // May be only partially initialized.
 #endif // V_DOT2_F32_F16_AVAILABLE
-    int    Q_i32[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
-    float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
+    int    Q_i32[ncol_tot][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
+    float2  Q_ds[ncol_tot][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
 
     ggml_cuda_pdl_sync();
-    if constexpr (Q_q8_1) {
+    if constexpr (Q_q8_1 && ncols2 == 1) {
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
@@ -201,6 +219,64 @@ static __global__ void flash_attn_ext_vec(
         }
 
         __syncthreads();
+    } else if constexpr (Q_q8_1) {
+        // Packed layout so all ncol_tot columns fit in shared memory next to each other:
+        constexpr int qcol_i32 = D/sizeof(int);  // ints holding the quantized values of one column
+        constexpr int qcol_ds  = qcol_i32/QI8_1; // float2 scale entries per column
+
+        __shared__ __align__(16) int    KQ_q[ncol_tot*qcol_i32];
+        __shared__ __align__(16) float2 KQ_d[ncol_tot*qcol_ds ];
+
+#pragma unroll
+        for (int c0 = 0; c0 < ncol_tot; c0 += nwarps) {
+            const int c = c0 + threadIdx.y;
+
+            if (c0 + nwarps > ncol_tot && c >= ncol_tot) {
+                break;
+            }
+
+            int    * tmp_q_i32 = KQ_q + c*qcol_i32;
+            float2 * tmp_q_ds  = KQ_d + c*qcol_ds;
+
+            // Set memory to zero if out of bounds:
+            if (ncols > 1 && ic0 + c%ncols >= int(ne01.z)) {
+#pragma unroll
+                for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += WARP_SIZE) {
+                    const int i = i0 + threadIdx.x;
+
+                    if (i0 + WARP_SIZE <= int(D/sizeof(int)) || i < int(D/sizeof(int))) {
+                        tmp_q_i32[i] = 0;
+                    }
+                }
+                if (threadIdx.x < D/QK8_1) {
+                    tmp_q_ds[threadIdx.x] = make_float2(0.0f, 0.0f);
+                }
+            } else {
+                const float * Q_f = (const float *) (Q + (c/ncols)*nb02 + (c%ncols)*nb01);
+                constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
+#pragma unroll
+                for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
+                    quantize_q8_1_to_shared<float2, nthreads_quantize>
+                        (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+                }
+            }
+        }
+
+        __syncthreads();
+
+#pragma unroll
+        for (int c = 0; c < ncol_tot; ++c) {
+            int    * tmp_q_i32 = KQ_q + c*qcol_i32;
+            float2 * tmp_q_ds  = KQ_d + c*qcol_ds;
+
+#pragma unroll
+            for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_KQ) {
+                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+
+                Q_i32[c][i0/nthreads_KQ] = tmp_q_i32[i];
+                Q_ds [c][i0/nthreads_KQ]  = tmp_q_ds[i/QI8_1];
+            }
+        }
     } else {
 #ifdef V_DOT2_F32_F16_AVAILABLE
         const half2 scale_h2 = make_half2(scale, scale);
@@ -256,12 +332,12 @@ static __global__ void flash_attn_ext_vec(
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
         // Calculate KQ tile and keep track of new maximum KQ values:
-        float KQ_reg[ncols]; // KQ in registers.
+        float KQ_reg[ncol_tot]; // KQ in registers.
 
-        float KQ_max_new[ncols];
+        float KQ_max_new[ncol_tot];
 #pragma unroll
-        for (int j = 0; j < ncols; ++j) {
-            KQ_max_new[j] = KQ_max[j];
+        for (int c = 0; c < ncol_tot; ++c) {
+            KQ_max_new[c] = KQ_max[c];
         }
 
 #pragma unroll
@@ -269,50 +345,51 @@ static __global__ void flash_attn_ext_vec(
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
 
 #pragma unroll
-            for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+            for (int c = 0; c < ncol_tot; ++c) {
+                // With ncols2 > 1 the K row is re-read here, but it stays in L1 from the previous columns:
+                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[c], Q_i32[c], Q_ds[c]);
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
                     sum = logit_softcap*tanhf(sum);
                 }
 
-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                if (mask && (ncols == 1 || ic0 + c%ncols < int(ne01.z))) {
+                    sum += slope*__half2float(maskh[(c%ncols)*ne11 + i_KQ]);
                 }
 
-                KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+                KQ_max_new[c] = fmaxf(KQ_max_new[c], sum + FATTN_KQ_MAX_OFFSET);
 
                 if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
-                    KQ_reg[j] = sum;
+                    KQ_reg[c] = sum;
                 }
             }
         }
 
 #pragma unroll
-        for (int j = 0; j < ncols; ++j) {
+        for (int c = 0; c < ncol_tot; ++c) {
 #pragma unroll
             for (int offset = nthreads_KQ; offset < WARP_SIZE; offset <<= 1) {
-                KQ_max_new[j] = fmaxf(KQ_max_new[j], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[j], offset, WARP_SIZE));
+                KQ_max_new[c] = fmaxf(KQ_max_new[c], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[c], offset, WARP_SIZE));
             }
-            const float KQ_max_scale = expf(KQ_max[j] - KQ_max_new[j]);
-            KQ_max[j] = KQ_max_new[j];
+            const float KQ_max_scale = expf(KQ_max[c] - KQ_max_new[c]);
+            KQ_max[c] = KQ_max_new[c];
 
-            KQ_reg[j] = expf(KQ_reg[j] - KQ_max[j]);
-            KQ_sum[j] = KQ_sum[j]*KQ_max_scale + KQ_reg[j];
-            KQ[j*nthreads + tid] = KQ_reg[j];
+            KQ_reg[c] = expf(KQ_reg[c] - KQ_max[c]);
+            KQ_sum[c] = KQ_sum[c]*KQ_max_scale + KQ_reg[c];
+            KQ[c*nthreads + tid] = KQ_reg[c];
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
-                VKQ[j][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
+                VKQ[c][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
             }
 #else
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
-                VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
-                VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
+                VKQ[c][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
+                VKQ[c][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
             }
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
@@ -324,10 +401,10 @@ static __global__ void flash_attn_ext_vec(
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            half2 KQ_k[ncols];
+            half2 KQ_k[ncol_tot];
 #pragma unroll
-            for (int j = 0; j < ncols; ++j) {
-                KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
+            for (int c = 0; c < ncol_tot; ++c) {
+                KQ_k[c] = __half2half2(KQ[c*nthreads + k]);
             }
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
@@ -347,16 +424,16 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
-                    for (int j = 0; j < ncols; ++j) {
-                        VKQ[j][i_VKQ_0/nthreads_V + i_VKQ_1] += tmp[i_VKQ_1]*KQ_k[j];
+                    for (int c = 0; c < ncol_tot; ++c) {
+                        VKQ[c][i_VKQ_0/nthreads_V + i_VKQ_1] += tmp[i_VKQ_1]*KQ_k[c];
                     }
                 }
             }
 #else
-            float KQ_k[ncols];
+            float KQ_k[ncol_tot];
 #pragma unroll
-            for (int j = 0; j < ncols; ++j) {
-                KQ_k[j] = KQ[j*nthreads + k];
+            for (int c = 0; c < ncol_tot; ++c) {
+                KQ_k[c] = KQ[c*nthreads + k];
             }
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
@@ -366,9 +443,9 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
-                    for (int j = 0; j < ncols; ++j) {
-                        VKQ[j][i_VKQ_0/nthreads_V + i_VKQ_1].x += tmp[i_VKQ_1].x*KQ_k[j];
-                        VKQ[j][i_VKQ_0/nthreads_V + i_VKQ_1].y += tmp[i_VKQ_1].y*KQ_k[j];
+                    for (int c = 0; c < ncol_tot; ++c) {
+                        VKQ[c][i_VKQ_0/nthreads_V + i_VKQ_1].x += tmp[i_VKQ_1].x*KQ_k[c];
+                        VKQ[c][i_VKQ_0/nthreads_V + i_VKQ_1].y += tmp[i_VKQ_1].y*KQ_k[c];
                     }
                 }
             }
@@ -377,68 +454,70 @@ static __global__ void flash_attn_ext_vec(
     }
 
     if (sinks && blockIdx.y == 0) {
-        const float sink = ((const float *) sinks)[head];
-
 #pragma unroll
-        for (int j0 = 0; j0 < ncols; j0 += nwarps) {
-            const int j = j0 + threadIdx.y;
+        for (int c0 = 0; c0 < ncol_tot; c0 += nwarps) {
+            const int c = c0 + threadIdx.y;
 
-            if (j0 + nwarps > ncols && j >= ncols) {
+            if (c0 + nwarps > ncol_tot && c >= ncol_tot) {
                 break;
             }
 
-            const float kqmax_new_j = fmaxf(sink, KQ_max[j]);
-            const float KQ_max_scale = expf(KQ_max[j] - kqmax_new_j);
-            KQ_max[j] = kqmax_new_j;
+            // sinks are per q-head:
+            const float sink = ((const float *) sinks)[head + c/ncols];
 
-            KQ_sum[j] = KQ_sum[j]*KQ_max_scale + (threadIdx.x == 0 ? expf(sink - KQ_max[j]) : 0.0f);
+            const float kqmax_new_c = fmaxf(sink, KQ_max[c]);
+            const float KQ_max_scale = expf(KQ_max[c] - kqmax_new_c);
+            KQ_max[c] = kqmax_new_c;
+
+            KQ_sum[c] = KQ_sum[c]*KQ_max_scale + (threadIdx.x == 0 ? expf(sink - KQ_max[c]) : 0.0f);
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
-                VKQ[j][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
+                VKQ[c][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
             }
 #else
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
-                VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
-                VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
+                VKQ[c][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
+                VKQ[c][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
             }
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
     }
 
-    __shared__ float KQ_max_shared[ncols][WARP_SIZE];
-    __shared__ float KQ_sum_shared[ncols][WARP_SIZE];
+    __shared__ float KQ_max_shared[ncol_tot][WARP_SIZE];
+    __shared__ float KQ_sum_shared[ncol_tot][WARP_SIZE];
 #pragma unroll
-    for (int j = 0; j < ncols; ++j) {
+    for (int c = 0; c < ncol_tot; ++c) {
         if (threadIdx.y == 0) {
-            KQ_max_shared[j][threadIdx.x] = -FLT_MAX/2.0f;
-            KQ_sum_shared[j][threadIdx.x] = 0.0f;
+            KQ_max_shared[c][threadIdx.x] = -FLT_MAX/2.0f;
+            KQ_sum_shared[c][threadIdx.x] = 0.0f;
         }
     }
 
     __syncthreads();
 
 #pragma unroll
-    for (int j = 0; j < ncols; ++j) {
+    for (int c = 0; c < ncol_tot; ++c) {
         if (threadIdx.x == 0) {
-            KQ_max_shared[j][threadIdx.y] = KQ_max[j];
+            KQ_max_shared[c][threadIdx.y] = KQ_max[c];
         }
     }
     __syncthreads();
 
 #pragma unroll
-    for (int j_VKQ = 0; j_VKQ < ncols; ++j_VKQ) {
-        if (ncols > 1 && ic0 + j_VKQ >= int(ne01.z)) {
+    for (int c = 0; c < ncol_tot; ++c) {
+        if (ncols > 1 && ic0 + c%ncols >= int(ne01.z)) {
+            // The launcher only uses ncols2 blocks per KV head, so the remaining columns of a group are all out of bounds:
             break;
         }
 
-        float kqmax_new = KQ_max_shared[j_VKQ][threadIdx.x];
+        float kqmax_new = KQ_max_shared[c][threadIdx.x];
         kqmax_new = warp_reduce_max(kqmax_new);
-        const float kqmax_scale = expf(KQ_max[j_VKQ] - kqmax_new);
-        KQ_max[j_VKQ] = kqmax_new;
+        const float kqmax_scale = expf(KQ_max[c] - kqmax_new);
+        KQ_max[c] = kqmax_new;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
         half2 * VKQ_tmp = (half2 *) KQ + threadIdx.y*(V_cols_per_iter*D/2)
@@ -447,13 +526,13 @@ static __global__ void flash_attn_ext_vec(
         const half2 kqmax_scale_h2 = make_half2(kqmax_scale, kqmax_scale);
 #pragma unroll
         for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
-            VKQ[j_VKQ][i_VKQ_0/nthreads_V] *= kqmax_scale_h2;
+            VKQ[c][i_VKQ_0/nthreads_V] *= kqmax_scale_h2;
         }
 #pragma unroll
         for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
             const int i_VKQ = i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*(V_rows_per_thread/2);
 
-            ggml_cuda_memcpy_1<V_rows_per_thread*sizeof(half)>(VKQ_tmp + i_VKQ, &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
+            ggml_cuda_memcpy_1<V_rows_per_thread*sizeof(half)>(VKQ_tmp + i_VKQ, &VKQ[c][i_VKQ_0/nthreads_V]);
         }
 #else
         float2 * VKQ_tmp = (float2 *) KQ + threadIdx.y*(V_cols_per_iter*D/2)
@@ -461,29 +540,29 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
         for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
-            VKQ[j_VKQ][i_VKQ_0/nthreads_V].x *= kqmax_scale;
-            VKQ[j_VKQ][i_VKQ_0/nthreads_V].y *= kqmax_scale;
+            VKQ[c][i_VKQ_0/nthreads_V].x *= kqmax_scale;
+            VKQ[c][i_VKQ_0/nthreads_V].y *= kqmax_scale;
         }
 #pragma unroll
         for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
             const int i_VKQ = i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*(V_rows_per_thread/2);
 
-            ggml_cuda_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ,                       &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
-            ggml_cuda_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ + V_rows_per_thread/4, &VKQ[j_VKQ][i_VKQ_0/nthreads_V + V_rows_per_thread/4]);
+            ggml_cuda_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ,                       &VKQ[c][i_VKQ_0/nthreads_V]);
+            ggml_cuda_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ + V_rows_per_thread/4, &VKQ[c][i_VKQ_0/nthreads_V + V_rows_per_thread/4]);
         }
 #endif // V_DOT2_F32_F16_AVAILABLE
 
-        KQ_sum[j_VKQ] *= kqmax_scale;
-        KQ_sum[j_VKQ] = warp_reduce_sum(KQ_sum[j_VKQ]);
+        KQ_sum[c] *= kqmax_scale;
+        KQ_sum[c] = warp_reduce_sum(KQ_sum[c]);
         if (threadIdx.x == 0) {
-            KQ_sum_shared[j_VKQ][threadIdx.y] = KQ_sum[j_VKQ];
+            KQ_sum_shared[c][threadIdx.y] = KQ_sum[c];
         }
 
         __syncthreads();
 
         if (nthreads <= D || tid < D) {
-            KQ_sum[j_VKQ] = KQ_sum_shared[j_VKQ][threadIdx.x];
-            KQ_sum[j_VKQ] = warp_reduce_sum(KQ_sum[j_VKQ]);
+            KQ_sum[c] = KQ_sum_shared[c][threadIdx.x];
+            KQ_sum[c] = warp_reduce_sum(KQ_sum[c]);
 
 #pragma unroll
             for (int i0 = 0; i0 < D; i0 += nthreads) {
@@ -496,20 +575,20 @@ static __global__ void flash_attn_ext_vec(
                     }
                 }
                 if (gridDim.y == 1) {
-                    dst_val /= KQ_sum[j_VKQ];
+                    dst_val /= KQ_sum[c];
                 }
-                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+                dst[(((sequence*int(ne01.z) + ic0 + c%ncols)*ne02 + head + c/ncols)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
             }
         }
 
-        if (j_VKQ < ncols-1) {
+        if (c < ncol_tot-1) {
             __syncthreads();
         }
 
     }
 
-    if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
-        dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
+    if (gridDim.y != 1 && tid < ncol_tot && (ncols == 1 || ic0 + tid%ncols < int(ne01.z))) {
+        dst_meta[((sequence*int(ne01.z) + ic0 + tid%ncols)*ne02 + head + tid/ncols)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
@@ -528,35 +607,84 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
-template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+template <int D, int cols_per_block, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, ncols2, type_K, type_V, use_logit_softcap>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+    launch_fattn<D, cols_per_block, ncols2>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+}
+
+// Batched variants are only instantiated for quantized K and the common KV type pairs to keep compile times down:
+template <int D, ggml_type type_K, ggml_type type_V>
+static constexpr bool ggml_cuda_flash_attn_ext_vec_batched_available() {
+    return D >= 128 &&
+           (type_K == GGML_TYPE_Q4_0 || type_K == GGML_TYPE_Q5_0 || type_K == GGML_TYPE_Q8_0) &&
+           (type_V == type_K || type_V == GGML_TYPE_F16);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
     const ggml_tensor * Q   = dst->src[0];
+    const ggml_tensor * K   = dst->src[1];
+    const ggml_tensor * V   = dst->src[2];
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
-        if (logit_softcap == 0.0f) {
-            constexpr bool use_logit_softcap = false;
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+
+        // GQA batching: compute all q-heads sharing a K/V head in one block so each KV tile is read from memory only once.
+        // Requires per-tile masking, no ALiBi and an exact K/V type match (see ggml_cuda_flash_attn_ext_vec_batched_available):
+        static const bool gqa_batching_enabled = []() {
+            const char * env = getenv("GGML_CUDA_FA_VEC_GQA_BATCH");
+            return !(env && strcmp(env, "0") == 0);
+        }();
+
+        int ncols2 = 1;
+        if constexpr (ggml_cuda_flash_attn_ext_vec_batched_available<D, type_K, type_V>()) {
+            float max_bias = 0.0f;
+            memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+            const ggml_tensor * mask = dst->src[3];
+            if (gqa_batching_enabled && mask && max_bias == 0.0f && logit_softcap == 0.0f && K->type == type_K && V->type == type_V) {
+                const int gqa_ratio = Q->ne[2] / K->ne[2];
+                for (int n : {6, 4, 2}) {
+                    if (gqa_ratio % n == 0) {
+                        ncols2 = n;
+                        break;
+                    }
+                }
+            }
+
+            if (logit_softcap == 0.0f) {
+                constexpr bool use_logit_softcap = false;
+                switch (ncols2) {
+                    case 6: ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 6, type_K, type_V, use_logit_softcap>(ctx, dst); break;
+                    case 4: ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 4, type_K, type_V, use_logit_softcap>(ctx, dst); break;
+                    case 2: ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 2, type_K, type_V, use_logit_softcap>(ctx, dst); break;
+                    default: ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 1, type_K, type_V, use_logit_softcap>(ctx, dst); break;
+                }
+            } else {
+                constexpr bool use_logit_softcap = true;
+                GGML_ASSERT(ncols2 == 1); // the selection above requires logit_softcap == 0 for ncols2 > 1
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 1, type_K, type_V, use_logit_softcap>(ctx, dst);
+            }
         } else {
-            constexpr bool use_logit_softcap = true;
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            if (logit_softcap == 0.0f) {
+                constexpr bool use_logit_softcap = false;
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 1, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else {
+                constexpr bool use_logit_softcap = true;
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 1, type_K, type_V, use_logit_softcap>(ctx, dst);
+            }
         }
         return;
     }
@@ -564,10 +692,10 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     constexpr int cols_per_block = 2;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 1, type_K, type_V, use_logit_softcap>(ctx, dst);
     } else {
         constexpr bool use_logit_softcap = true;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 1, type_K, type_V, use_logit_softcap>(ctx, dst);
     }
 }
 

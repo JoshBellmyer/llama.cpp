@@ -1552,26 +1552,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
-    if (all_zero) {
-        // default split, by free memory
-        // when all devices report a memory bandwidth, weight the split by it so that more of the model
-        // ends up on the faster device; decode is usually memory-bandwidth-bound
-        std::vector<size_t> bw(n_devices(), 1);
+    std::vector<llama_device> split_devs = devices; // device order used for the default split below
+    if (all_zero && n_devices() > 1) {
+        struct dev_share { llama_device dev; double free; size_t bw; double share; };
+        std::vector<dev_share> devs(n_devices());
         bool have_bw = true;
+        double sum_free = 0.0;
+        double sum_free_bw = 0.0;
         for (size_t i = 0; i < n_devices(); ++i) {
             ggml_backend_dev_props props = {};
             ggml_backend_dev_get_props(devices[i].dev, &props);
-            if (props.memory_bandwidth == 0) {
-                have_bw = false;
-                break;
-            }
-            bw[i] = props.memory_bandwidth;
-        }
-        for (size_t i = 0; i < n_devices(); ++i) {
-            ggml_backend_dev_t dev = devices[i].dev;
+
             size_t total;
             size_t free;
-            ggml_backend_dev_memory(dev, &free, &total);
+            ggml_backend_dev_memory(devices[i].dev, &free, &total);
 
             // devices can return 0 bytes for free and total memory if they do not
             // have any to report. in this case, we will use the host memory as a fallback
@@ -1579,10 +1573,44 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (free == 0 && total == 0) {
                 ggml_backend_dev_memory(cpu_dev, &free, &total);
             }
-            splits[i] = have_bw ? float(free * bw[i]) : float(free);
-            LLAMA_LOG_DEBUG("load_tensors: TEMP device %zu free = %zu MiB, bw = %zu GB/s\n", i, free >> 20, bw[i] / 1000000000ull);
+
+            devs[i] = { devices[i], double(free), props.memory_bandwidth, 0.0 };
+            sum_free += double(free);
+            if (props.memory_bandwidth == 0) {
+                have_bw = false;
+            } else {
+                sum_free_bw += double(free) * double(props.memory_bandwidth);
+            }
         }
-    } else {
+
+        for (size_t i = 0; i < n_devices(); ++i) {
+            if (!have_bw) {
+                // default split, by free memory: the KV cache is allocated after model load and follows
+                // layer placement, so every device keeps a share of headroom for it
+                devs[i].share = devs[i].free / sum_free;
+            } else {
+                // decode is usually memory-bandwidth-bound: bias the split toward the faster device.
+                // keep at least 3/4 of each device's proportional headroom, since the future KV demand
+                // is unknown here and an aggressive fill-first can OOM on tight setups
+                const double share_bw   = devs[i].free * double(devs[i].bw) / sum_free_bw;
+                const double share_keep = 0.75 * devs[i].free / sum_free;
+                devs[i].share = std::max(share_bw, share_keep);
+            }
+        }
+
+        // the output layer and trailing layers (e.g. MTP blocks) always land on the last device and are
+        // read on every decode step: order by ascending bandwidth so that the fastest one is last
+        if (have_bw) {
+            std::stable_sort(devs.begin(), devs.end(), [](const auto & a, const auto & b) { return a.bw < b.bw; });
+        }
+
+        for (size_t i = 0; i < n_devices(); ++i) {
+            split_devs[i] = devs[i].dev;
+            splits[i] = float(devs[i].share);
+            LLAMA_LOG_DEBUG("load_tensors: default split device %zu (%s): free = %.1f GiB, bandwidth = %zu GB/s\n",
+                i, ggml_backend_dev_name(split_devs[i].dev), devs[i].free / 1073741824.0, have_bw ? devs[i].bw / 1000000000ull : 0);
+        }
+    } else if (!all_zero) {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
     }
 
@@ -1605,7 +1633,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
-        auto * dev = devices.at(layer_gpu).dev;
+        auto * dev = split_devs.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
